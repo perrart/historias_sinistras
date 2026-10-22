@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Converte content/casos.txt em src/MysteryData.h e valida cada caso.
+
+Formato de cada caso (veja content/casos.txt):
+
+    === CASO 051
+    TITULO: O NOVO MISTÉRIO
+    CATEGORIA: ASSASSINATOS
+    DIFICULDADE: MÉDIO
+    CENARIO:
+    texto...
+    DICA 1:
+    ...
+    DICA 4:
+    ...
+    VERDADE:
+    parágrafo 1
+
+    parágrafo 2
+
+Uso:  python3 tools/gen_mysteries.py            (gera o header)
+      python3 tools/gen_mysteries.py --check    (só valida)
+"""
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_TXT = os.path.join(ROOT, 'content', 'casos.txt')
+OUT_H = os.path.join(ROOT, 'src', 'MysteryData.h')
+
+CATEGORIES = ['ASSASSINATOS', 'MORTES MISTERIOSAS', 'CRIMES IMPOSSÍVEIS', 'DESAPARECIMENTOS',
+              'ACIDENTES FATAIS', 'SEGREDOS MACABROS', 'MISTÉRIOS PSICOLÓGICOS']
+DIFFICULTIES = ['FÁCIL', 'MÉDIO', 'DIFÍCIL', 'INSANO']
+
+# Caracteres que as fontes embutidas desenham (ASCII imprimível + Latin-1 + tipografia)
+ALLOWED = set(chr(c) for c in range(0x20, 0x7F)) | set(chr(c) for c in range(0xA0, 0x100)) | \
+    set('\u2014\u2013\u2026\u201C\u201D\u2018\u2019\u2022')
+# O título grande usa um subconjunto (maiúsculas)
+TITLE_ALLOWED = set(chr(c) for c in range(0x20, 0x60)) | set(chr(c) for c in range(0xC0, 0xDE)) | {'\u2014'}
+
+SECTION_RE = re.compile(r'^(TITULO|CATEGORIA|DIFICULDADE):\s*(.*)$')
+BLOCK_RE = re.compile(r'^(CENARIO|DICA [1-4]|VERDADE):\s*$')
+
+
+def norm_paragraphs(lines):
+    paras, cur = [], []
+    for ln in lines:
+        if ln.strip() == '':
+            if cur:
+                paras.append(' '.join(cur))
+                cur = []
+        else:
+            cur.append(ln.strip())
+    if cur:
+        paras.append(' '.join(cur))
+    text = '\n'.join(paras)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+
+def parse(path):
+    raw = open(path, encoding='utf-8').read().replace('\r\n', '\n')
+    cases = []
+    chunks = re.split(r'^=== CASO\s+(\d+)\s*$', raw, flags=re.M)
+    for i in range(1, len(chunks), 2):
+        cid = int(chunks[i])
+        body = chunks[i + 1].split('\n')
+        case = {'id': cid, 'clues': {}}
+        cur_block, buf = None, []
+
+        def flush():
+            if cur_block is None:
+                return
+            text = norm_paragraphs(buf)
+            if cur_block == 'CENARIO':
+                case['scenario'] = text
+            elif cur_block == 'VERDADE':
+                case['solution'] = text
+            else:
+                case['clues'][int(cur_block[-1])] = text
+
+        for ln in body:
+            m = SECTION_RE.match(ln.strip())
+            b = BLOCK_RE.match(ln.strip())
+            if m and cur_block is None:
+                key, val = m.group(1), m.group(2).strip()
+                case[{'TITULO': 'title', 'CATEGORIA': 'category', 'DIFICULDADE': 'difficulty'}[key]] = val
+            elif b:
+                flush()
+                cur_block, buf = b.group(1), []
+            elif cur_block is not None:
+                buf.append(ln)
+        flush()
+        cases.append(case)
+    return cases
+
+
+def validate(cases):
+    errors, warnings = [], []
+    seen = set()
+    for c in cases:
+        tag = 'CASO %03d' % c['id']
+        if c['id'] in seen:
+            errors.append('%s: ID duplicado' % tag)
+        seen.add(c['id'])
+        if not (1 <= c['id'] <= 255):
+            errors.append('%s: ID deve estar entre 1 e 255' % tag)
+        for k in ('title', 'category', 'difficulty', 'scenario', 'solution'):
+            if not c.get(k):
+                errors.append('%s: campo ausente: %s' % (tag, k))
+        if sorted(c['clues'].keys()) != [1, 2, 3, 4]:
+            errors.append('%s: precisa de exatamente 4 dicas (tem %s)' % (tag, sorted(c['clues'].keys())))
+        if c.get('category') not in CATEGORIES:
+            errors.append('%s: categoria inválida: %r' % (tag, c.get('category')))
+        if c.get('difficulty') not in DIFFICULTIES:
+            errors.append('%s: dificuldade inválida: %r' % (tag, c.get('difficulty')))
+        texts = [c.get('title', ''), c.get('scenario', ''), c.get('solution', '')] + list(c['clues'].values())
+        for t in texts:
+            bad = sorted(set(ch for ch in t if ch not in ALLOWED and ch != '\n'))
+            if bad:
+                errors.append('%s: caracteres sem glifo: %s' % (tag, ' '.join('U+%04X' % ord(b) for b in bad)))
+        if c.get('title') and c['title'] != c['title'].upper():
+            warnings.append('%s: título deveria estar em maiúsculas' % tag)
+        if c.get('scenario') and not c['scenario'].rstrip().endswith('?'):
+            warnings.append('%s: cenário não termina com pergunta' % tag)
+        if c.get('scenario') and len(c['scenario']) > 420:
+            warnings.append('%s: cenário longo (%d)' % (tag, len(c['scenario'])))
+    return errors, warnings
+
+
+def c_str(s):
+    out = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+    return '"%s"' % out
+
+
+def emit(cases):
+    lines = ['// AUTO-GENERATED by tools/gen_mysteries.py from content/casos.txt - do not edit by hand.',
+             '#pragma once', '#include "MysteryDatabase.h"', '',
+             'static const Mystery MYSTERIES[] = {']
+    for c in cases:
+        clues = ', '.join(c_str(c['clues'][i]) for i in (1, 2, 3, 4))
+        lines.append('  {%d, %d, %d,\n   %s,\n   %s,\n   {%s},\n   %s},' % (
+            c['id'], CATEGORIES.index(c['category']), DIFFICULTIES.index(c['difficulty']),
+            c_str(c['title']), c_str(c['scenario']), clues, c_str(c['solution'])))
+    lines.append('};')
+    lines.append('static const uint16_t MYSTERY_COUNT = sizeof(MYSTERIES) / sizeof(MYSTERIES[0]);')
+    lines.append('')
+    with open(OUT_H, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+
+def main():
+    cases = parse(SRC_TXT)
+    errors, warnings = validate(cases)
+    for w in warnings:
+        print('aviso:', w)
+    for e in errors:
+        print('ERRO:', e)
+    if errors:
+        sys.exit(1)
+    cases.sort(key=lambda c: c['id'])
+    total = sum(len(c['scenario']) + len(c['solution']) + sum(len(v) for v in c['clues'].values()) for c in cases)
+    print('%d casos válidos, %d caracteres de texto' % (len(cases), total))
+    if '--check' not in sys.argv:
+        emit(cases)
+        print('gerado', os.path.relpath(OUT_H, ROOT))
+
+
+if __name__ == '__main__':
+    main()
