@@ -1,0 +1,9 @@
+.pio/
+.arduino/
+release/
+sim/build/
+sim/out/
+tools/__pycache__/
+tools/_preview_*.png
+tools/_tmp.vlw
+build/
