@@ -1,0 +1,43 @@
+# Compila o firmware a cada push e publica os .bin como artefato.
+# Em um fork: aba Actions -> "Build firmware" -> Run workflow -> baixe o artefato.
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Instalar PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Validar e gerar o banco de casos
+        run: python3 tools/gen_mysteries.py
+
+      - name: Compilar
+        run: pio run
+
+      - name: Publicar binários
+        uses: actions/upload-artifact@v4
+        with:
+          name: historias_sinistras-firmware
+          path: |
+            release/historias_sinistras.bin
+            release/historias_sinistras_app.bin
